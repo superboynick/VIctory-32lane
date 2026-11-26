@@ -1973,6 +1973,8 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        #[cfg(feature = "diagnostics")]
+        let _cost = crate::list::record_cost::Scope::new(8);
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -2214,6 +2216,31 @@ fn view_extent() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_EXTENT").is_none_or(|v| v != "0"))
 }
 
+#[cfg(feature = "diagnostics")]
+struct BufferCopyTime(Option<std::time::Instant>);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for BufferCopyTime {
+    fn drop(&mut self) {
+        let Some(start) = self.0 else { return };
+        let elapsed = start.elapsed().as_nanos() as u64;
+        thread_local! {
+            static TOTAL: std::cell::RefCell<(std::time::Instant, u64, u64)> =
+                std::cell::RefCell::new((std::time::Instant::now(), 0, 0));
+        }
+        TOTAL.with(|total| {
+            let mut t = total.borrow_mut();
+            t.1 += 1;
+            t.2 += elapsed;
+            if t.0.elapsed().as_secs() >= 5 {
+                tracing::info!(calls = t.1, ns = t.2, ns_per_call = t.2 / t.1,
+                    "buffer copy profile");
+                *t = (std::time::Instant::now(), 0, 0);
+            }
+        });
+    }
+}
+
 /// The host copy buffer view `view` reads, and the title range (address,
 /// bytes) it reads there; `None` for other views and empty ranges.
 ///
@@ -2226,6 +2253,8 @@ fn view_extent() -> bool {
 /// buffer object. The slot then showed a copy nothing brought up to date,
 /// and what shaders wrote through it was looked for in the other copy.
 pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    #[cfg(feature = "diagnostics")]
+    let _time = BufferCopyTime(crate::list::state_profiling().then(std::time::Instant::now));
     let (address, len) = buffer_range(view)?;
     if len == 0 {
         return None;
@@ -2234,20 +2263,27 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     // (`own_bytes`): the same question `buffer_srv` and `buffer_uav` ask,
     // of the copy they find, so that the copy brought up to date is the
     // one the slot shows.
-    if let Some((base, width)) = buffer_extent(view)
+    let extent = buffer_extent(view);
+    let mut found = None;
+    if let Some((base, width)) = extent
         && let Some((first, count, element, stride, unknown)) = buffer_fields(view)
         && let Some(whole) = crate::shadow::find(base, width)
-        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
-        && let Some(own) = crate::shadow::exact(start, bytes)
     {
-        return Some((own, start, bytes));
+        if let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
+            && let Some(own) = crate::shadow::exact(start, bytes)
+        {
+            return Some((own, start, bytes));
+        }
+        // Reuse only this call's successful lookup. Failed lookups still retry;
+        // the next call observes resource registration and release afresh.
+        found = Some(whole);
     }
     if view_extent()
-        && let Some((base, width)) = buffer_extent(view)
+        && let Some((base, width)) = extent
         // (The console is lax: a view may begin past its buffer's end.)
         && address >= base
         && address - base < width.max(1)
-        && let Some(shadow) = crate::shadow::find(base, width)
+        && let Some(shadow) = found.or_else(|| crate::shadow::find(base, width))
     {
         return Some((shadow, address, len));
     }
@@ -3180,6 +3216,56 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffer_copy_preserves_whole_own_and_fallback_ranges() {
+        use std::sync::Arc;
+        use windows_sys::Win32::System::Memory::*;
+        assert!(host().is_some(), "this regression requires a real D3D12 device");
+        assert!(view_extent() && own_copy_on(), "run with default view switches");
+        // SAFETY: owned, committed memory, released after unregistering it.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!memory.is_null());
+        let base = memory as u64;
+        crate::shadow::register(base as usize, base, 65536);
+        let whole = crate::shadow::find(base, 65536).unwrap();
+        let view = |at: u64, width, format, first, count, unordered| {
+            let mut resource = [0u32; 14];
+            resource[0] = 1;
+            resource[4] = width;
+            let mut desc = [0u32; 16];
+            desc[0] = format;
+            desc[1] = 1;
+            let offset = if unordered { 2 } else { 4 };
+            desc[offset] = first;
+            desc[offset + 2] = count;
+            desc[10] = at as u32;
+            desc[11] = (at >> 32) as u32;
+            View::Placed(unordered, resource, desc)
+        };
+        for unordered in [false, true] {
+            let ordinary = view(base, 4096, 42, 4, 8, unordered);
+            let (copy, at, len) = buffer_copy(&ordinary).unwrap();
+            assert!(Arc::ptr_eq(&copy, &whole));
+            assert_eq!((at, len), (base + 16, 32));
+            // Twelve-byte typed elements, sixteen bytes into the whole copy.
+            let (copy, at, len) = buffer_copy(&view(base + 16, 4096, 6, 3, 10, unordered)).unwrap();
+            assert_eq!((at, len), (base + 52, 120));
+            assert!(Arc::ptr_eq(&copy, &crate::shadow::exact(at, len).unwrap()));
+            assert!(buffer_copy(&view(base, 4096, 42, 0, 0, unordered)).is_none());
+        }
+        // A view starting beyond its declared extent must use the range's copy.
+        crate::shadow::register((base + 16) as usize, base + 16, 32);
+        let inner = crate::shadow::find(base + 16, 32).unwrap();
+        let (copy, at, len) = buffer_copy(&view(base, 8, 42, 4, 8, false)).unwrap();
+        assert!(Arc::ptr_eq(&copy, &inner));
+        assert_eq!((at, len), (base + 16, 32));
+        assert!(buffer_copy(&View::Constant(base, 256)).is_none());
+        crate::shadow::unregister((base + 16) as usize, base + 16);
+        crate::shadow::unregister(base as usize, base);
+        // SAFETY: no recorded work refers to this test's title memory.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
 
     /// A constant view is made in 256-byte steps and at most 64 KiB, the
     /// most the host takes (a larger size removes the device on NVIDIA).

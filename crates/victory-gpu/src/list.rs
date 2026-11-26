@@ -142,17 +142,184 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
+#[track_caller]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
-    let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    let Some(list) = host_list(this) else { return };
+    #[cfg(feature = "diagnostics")]
+    let listed = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    let locked = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let costs = record_cost::snapshot();
+    #[cfg(feature = "record-detail")]
+    let detail_calls = record_cost::calls();
+    f(list, &mut state);
+    #[cfg(feature = "diagnostics")]
+    let finished = std::time::Instant::now();
+    drop(state);
+    #[cfg(feature = "diagnostics")]
+    {
+        let line = std::panic::Location::caller().line();
+        let parts = [listed - started, locked - listed, finished - locked].map(|d| d.as_nanos() as u64);
+        let after = record_cost::snapshot();
+        record_site(
+            line,
+            std::array::from_fn(|i| {
+                if i < 3 { return parts[i]; }
+                if i < 3 + record_cost::N { return after[i - 3].wrapping_sub(costs[i - 3]); }
+                #[cfg(feature = "record-detail")]
+                { return record_cost::calls()[i - 3 - record_cost::N].wrapping_sub(detail_calls[i - 3 - record_cost::N]); }
+                #[cfg(not(feature = "record-detail"))]
+                unreachable!()
+            }),
+        );
+        if state_profiling() {
+            state_site(line, parts, &after, &costs);
+        }
+    }
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
     #[cfg(feature = "diagnostics")]
     crate::profile::seen(crate::profile::Seen::Record);
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn record_profiling() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECORD_PROFILE").is_some())
+}
+
+/// Exclusive, nested CPU scopes; GPU execution is not included.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) mod record_cost {
+    use std::{cell::Cell, time::Instant};
+    pub(crate) const N: usize = if cfg!(feature = "record-detail") { 12 } else { 9 };
+    thread_local! { static NS: Cell<[u64; N]> = const { Cell::new([0; N]) }; }
+    #[cfg(feature = "record-detail")]
+    thread_local! { static CALLS: Cell<[u64; 3]> = const { Cell::new([0; 3]) }; }
+    pub(crate) fn snapshot() -> [u64; N] { NS.with(Cell::get) }
+    #[cfg(feature = "record-detail")]
+    pub(crate) fn calls() -> [u64; 3] { CALLS.with(Cell::get) }
+    pub(crate) struct Scope(Option<(Instant, u64, usize)>, Option<bool>);
+    impl Scope {
+        pub(crate) fn new(kind: usize) -> Self {
+            Self((super::record_profiling() || super::state_profiling()).then(|| (Instant::now(), snapshot().iter().sum(), kind)), None)
+        }
+        pub(crate) fn tables(&mut self, hit: bool) { self.1 = Some(hit); }
+    }
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            if let Some(hit) = self.1 {
+                use crate::framelog::{add, T};
+                add(if hit { T::TablesHit } else { T::TablesMiss }, 1);
+            }
+            if let Some((start, before, kind)) = self.0 {
+                let elapsed = start.elapsed().as_nanos() as u64;
+                NS.with(|ns| {
+                    let mut totals = ns.get();
+                    totals[kind] += elapsed.saturating_sub(totals.iter().sum::<u64>().wrapping_sub(before));
+                    ns.set(totals);
+                });
+                #[cfg(feature = "record-detail")]
+                if kind >= 9 {
+                    CALLS.with(|calls| {
+                        let mut totals = calls.get();
+                        totals[kind - 9] += 1;
+                        calls.set(totals);
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// `VICTORY_STATE_PROFILE`: where a draw state call's time goes, by call
+/// site, every 5 seconds. Off, the flag is one `OnceLock` read per call.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn state_profiling() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STATE_PROFILE").is_some())
+}
+
+/// `VICTORY_STATE_PROFILE`: a state call's three parts (the host list
+/// looked up, the state lock taken, `f` run) and, inside `f`, the record
+/// scopes the draw state keeps (`record_cost`), summed per call site.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn state_site(line: u32, ns: [u64; 3], after: &[u64; record_cost::N], before: &[u64; record_cost::N]) {
+    use std::{cell::RefCell, collections::BTreeMap, time::Instant};
+    thread_local! {
+        /// Calls, then the three parts, then the nine record scopes.
+        static SITES: RefCell<(Instant, BTreeMap<u32, [u64; record_cost::N + 4]>)> =
+            RefCell::new((Instant::now(), BTreeMap::new()));
+    }
+    SITES.with(|s| {
+        let mut s = s.borrow_mut();
+        let v = s.1.entry(line).or_default();
+        v[0] += 1;
+        for (sum, n) in v[1..4].iter_mut().zip(ns) { *sum += n; }
+        for (sum, (now, was)) in v[4..].iter_mut().zip(after.iter().zip(before)) {
+            *sum += now.saturating_sub(*was);
+        }
+        if s.0.elapsed().as_secs() < 5 { return; }
+        for (line, v) in &s.1 {
+            let (calls, exec) = (v[0], v[3]);
+            // What `f` spent outside the record scopes it has.
+            let other = exec.saturating_sub(v[4..].iter().sum::<u64>());
+            tracing::info!(line, get_list_ns = v[1], lock_ns = v[2], exec_ns = exec, calls,
+                get_list_ns_per_call = v[1] / calls, lock_ns_per_call = v[2] / calls,
+                exec_ns_per_call = exec / calls, "state site list.rs");
+            // In `f`: the hash of a fresh table (draw.rs:2999), descriptor
+            // tables (draw.rs:2911), the host command (draw.rs:3632 among
+            // others), and the rest.
+            tracing::info!(line, hash_ns = v[4], descriptors_ns = v[5], write_ns = v[10],
+                bind_ns = v[6], resources_ns = v[7], prepare_ns = v[9], other_ns = other, calls,
+                hash_ns_per_call = v[4] / calls, descriptors_ns_per_call = v[5] / calls,
+                write_ns_per_call = v[10] / calls, other_ns_per_call = other / calls,
+                "state f list.rs");
+        }
+        s.1.clear();
+        s.0 = Instant::now();
+    });
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+const RECORD_FIELDS: usize = if cfg!(feature = "record-detail") { 18 } else { 12 };
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn record_site(line: u32, ns: [u64; RECORD_FIELDS]) {
+    use std::{cell::RefCell, collections::BTreeMap, time::Instant};
+    if !record_profiling() { return; }
+    thread_local! {
+        static SITES: RefCell<(Instant, BTreeMap<u32, (u64, [u64; RECORD_FIELDS])>)> = RefCell::new((Instant::now(), BTreeMap::new()));
+    }
+    SITES.with(|s| {
+        let mut s = s.borrow_mut();
+        let v = s.1.entry(line).or_default();
+        v.0 += 1;
+        for (sum, n) in v.1.iter_mut().zip(ns) { *sum += n; }
+        if s.0.elapsed().as_secs() >= 5 {
+            for (line, (calls, ns)) in &s.1 {
+                tracing::info!(line, calls, ms = ns[..3].iter().sum::<u64>() as f64 / 1e6,
+                    list_ns = ns[0], lock_ns = ns[1], f_ns = ns[2],
+                    list_ns_per_call = ns[0] / calls, lock_ns_per_call = ns[1] / calls, f_ns_per_call = ns[2] / calls,
+                    hash_ns = ns[3], descriptors_ns = ns[4], bind_ns = ns[5], resources_ns = ns[6],
+                    textures_ns = ns[7], prepare_ns = ns[8], write_ns = ns[9],
+                    lookup_ns = ns[10], mirror_ns = ns[11],
+                    "record site list.rs");
+                #[cfg(feature = "record-detail")]
+                tracing::info!(line, exec_calls = calls, gather_ns = ns[12], pipeline_ns = ns[13], window_ns = ns[14],
+                    gather_calls = ns[15], pipeline_calls = ns[16], window_calls = ns[17],
+                    other_ns = ns[2].saturating_sub(ns[3..15].iter().sum::<u64>()), "record detail list.rs");
+            }
+            s.1.clear();
+            s.0 = Instant::now();
+        }
+    });
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'
@@ -2228,6 +2395,38 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "real command entry microbenchmark; run with --release --ignored --nocapture"]
+    fn bench_record_entries() {
+        let null = std::ptr::null();
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        assert!(host_list(list).is_some(), "a real host list is required");
+        let cases: [(&str, Box<dyn Fn()>); 5] = [
+            ("empty with_state", Box::new(|| with_state(list, |_, _| {}))),
+            ("graphics view", Box::new(|| state::graphics_view(list, 0, 0x10000))),
+            ("graphics table", Box::new(|| state::graphics_table(list, 0, 0x10000))),
+            ("graphics constant", Box::new(|| state::graphics_constant(list, 0, 42, 0))),
+            ("topology", Box::new(|| state::topology(list, 4))),
+        ];
+        for (name, call) in &cases {
+            let mut times = Vec::new();
+            for _ in 0..7 {
+                let start = std::time::Instant::now();
+                for _ in 0..50_000 { std::hint::black_box(call)(); }
+                times.push(start.elapsed().as_nanos());
+                assert_eq!(close(list), S_OK);
+                assert_eq!(reset(list, allocator, null), S_OK);
+            }
+            times.sort();
+            eprintln!("{name}: {:.1} ns/call, {:.3} ms/50000 (median of 7)", times[3] as f64 / 50_000.0, times[3] as f64 / 1e6);
+        }
+        list_release(list);
+        allocator_release(allocator);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

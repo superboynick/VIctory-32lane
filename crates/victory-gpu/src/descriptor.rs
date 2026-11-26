@@ -10,6 +10,13 @@
 use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid};
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
+static TABLE_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static VIEW_GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) fn table_versions() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Acquire;
+    (TABLE_WRITES.load(Acquire), VIEW_GENERATIONS.load(Acquire))
+}
+
 #[cfg(windows)]
 pub(crate) mod host;
 
@@ -933,6 +940,7 @@ fn record(handle: u64, view: View) {
     let [i, generation] = words_for(view);
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+    TABLE_WRITES.fetch_add(1, std::sync::atomic::Ordering::Release);
     #[cfg(windows)]
     mirror(handle);
 }
@@ -961,6 +969,7 @@ pub(crate) fn forget(resource: usize) {
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+        VIEW_GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Release);
         if crate::heap_pass::marked_set() {
             note_forgotten(i);
         }
@@ -1128,6 +1137,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     if dst != 0 && src != 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+        TABLE_WRITES.fetch_add(1, std::sync::atomic::Ordering::Release);
         #[cfg(windows)]
         for i in 0..u64::from(count) {
             mirror(dst + i * step);
@@ -1392,6 +1402,7 @@ mod tests {
         };
         let mut h: This = std::ptr::null();
         assert_eq!(create(desc, placement, &mut h), S_OK);
+        assert!(heap(h).host().is_some(), "D3D12 host required for mirror fast-path test");
         if let Some(host) = heap(h).host() {
             let mut elsewhere = [0u64; 2];
             let source = elsewhere.as_mut_ptr() as u64;
@@ -1408,6 +1419,31 @@ mod tests {
             assert!(!host.made(5));
             sync_heaps();
             assert!(host.made(5));
+            let handle = memory as u64 + 5 * 16;
+            let expected = view(handle);
+            std::thread::scope(|scope| {
+                for _ in 0..6 {
+                    let expected = &expected;
+                    scope.spawn(move || {
+                        for _ in 0..100 {
+                            assert_eq!(&host.mirror(5, handle, true), expected);
+                        }
+                    });
+                }
+            });
+            // A byte-copied replacement must bypass the unchanged-slot path.
+            let mut changed = sampler;
+            changed[1] = 2;
+            create_sampler(std::ptr::null(), &changed, source);
+            // SAFETY: source and destination are distinct live 16-byte slots.
+            unsafe { std::ptr::copy_nonoverlapping(source as *const u8, handle as *mut u8, 16) };
+            assert_ne!(view(handle), expected);
+            assert_eq!(host.mirror(5, handle, true), view(handle));
+            // An invalid record must clear the host descriptor even if made.
+            // SAFETY: handle still points to the test's allocated heap slot.
+            unsafe { (handle as *mut u32).write(0) };
+            assert_eq!(host.mirror(5, handle, true), None);
+            assert!(!host.made(5));
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.

@@ -246,7 +246,14 @@ pub(crate) fn ready(
     constants: &[u32],
     writes: bool,
 ) -> Option<Ready> {
+    #[cfg(feature = "resource-detail")]
+    let lock_cost = crate::resource_cost::Scope::new(10);
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "resource-detail")]
+    drop(lock_cost);
+    #[cfg(feature = "resource-detail")]
+    let pages_cost = crate::resource_cost::Scope::new(11);
+
     if guard.is_none() {
         *guard = Memory::new();
     }
@@ -275,6 +282,10 @@ pub(crate) fn ready(
             m.name(u64::from(c) << 8);
         }
     }
+    #[cfg(feature = "resource-detail")]
+    drop(pages_cost);
+    #[cfg(feature = "resource-detail")]
+    let views_cost = crate::resource_cost::Scope::new(12);
     let key = std::ptr::from_ref(heap) as usize;
     let (base, made) = match m.heaps.get(&key) {
         Some(&run) => run,
@@ -290,6 +301,10 @@ pub(crate) fn ready(
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
+    #[cfg(feature = "resource-detail")]
+    drop(views_cost);
+    #[cfg(feature = "resource-detail")]
+    let _copies_cost = crate::resource_cost::Scope::new(13);
     // Once per list, and for copies numbered since: the builder alone
     // dispatches hundreds of times a frame.
     // shortcut: a copy another list numbers meanwhile is brought up to date

@@ -3043,6 +3043,8 @@ impl Shadow {
             // range, most of whose ranges differ nowhere, was most of the
             // work for small ranges.
             let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+            #[cfg(feature = "diagnostics")]
+            let (mut run_count, mut write_calls, mut adjacent, mut previous_end) = (0usize, 0usize, 0usize, None);
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
@@ -3059,9 +3061,23 @@ impl Shadow {
                 // stretch is the title's as read, and a title write landing
                 // there since stays.
                 for &(off, len) in &runs {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        let address = start + at + off;
+                        adjacent += usize::from(previous_end == Some(address));
+                        previous_end = Some(address + len);
+                        run_count += 1;
+                        write_calls += crate::host::write_mapped_counted(address as *mut u8, title[off..].as_ptr(), len);
+                    }
+                    #[cfg(not(feature = "diagnostics"))]
                     crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
                     written += len;
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            if run_count != 0 && crate::framelog::on() {
+                tracing::info!(target: "victory_gpu::framelog", frame = crate::frame::current(),
+                    runs = run_count, writes = write_calls, adjacent, bytes = written, "copy-back runs");
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
@@ -4338,6 +4354,8 @@ thread_local! {
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    #[cfg(feature = "diagnostics")]
+    let _cost = crate::list::record_cost::Scope::new(7);
     if !lookup_cache() {
         return lookup_tables(address, len, any);
     }

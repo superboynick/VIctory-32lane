@@ -336,9 +336,28 @@ pub(crate) fn window_line(frames: f64) {
     );
 }
 
+struct TablesCache {
+    version: u64,
+    compute: bool,
+    used: Vec<UsedResource>,
+    indexed: Vec<RootIndexedView>,
+    fresh: Vec<u8>,
+    made: Vec<(u8, u32)>,
+    records: Vec<(u64, [u32; 3])>,
+    reads: Vec<(u64, ResourceType)>,
+}
+
+fn tables_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLES_CACHE").is_some_and(|v| v == "1"))
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    tables_version: u64,
+    table_descriptors: (u64, u64),
+    tables_cache: Vec<TablesCache>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -416,6 +435,11 @@ impl Drop for State {
 }
 
 impl State {
+    fn dirty_tables(&mut self) {
+        self.tables_version = self.tables_version.wrapping_add(1);
+        self.tables_cache.clear();
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -424,6 +448,7 @@ impl State {
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
+        self.dirty_tables();
         if self.tables_gone && self.dynamic.is_empty() {
             return;
         }
@@ -639,6 +664,8 @@ pub(crate) fn dispatched() -> u64 {
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+    #[cfg(feature = "diagnostics")]
+    let _cost = crate::list::record_cost::Scope::new(3);
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         std::env::var("VICTORY_ROOT_VIEW_MB")
@@ -705,20 +732,27 @@ impl State {
     }
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
+        if self.pipeline != pipeline as usize { self.dirty_tables(); }
         self.pipeline = pipeline as usize;
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
-        self.heaps = [0; 2];
+        let mut next = [0; 2];
         for &h in heaps {
             if !h.is_null() {
                 let samplers = crate::descriptor::heap(h).samplers();
-                self.heaps[usize::from(samplers)] = h as usize;
+                next[usize::from(samplers)] = h as usize;
             }
+        }
+        if self.heaps != next {
+            self.dirty_tables();
+            self.fresh_tables.clear(); // Placed heaps can share title addresses.
+            self.heaps = next;
         }
     }
 
     fn roots(&mut self, compute: bool) -> &mut Vec<Root> {
+        self.dirty_tables();
         if compute {
             &mut self.compute
         } else {
@@ -727,14 +761,18 @@ impl State {
     }
 
     pub(crate) fn set_table(&mut self, compute: bool, slot: u32, handle: u64) {
+        if matches!(self.roots_ref(compute).get(slot as usize), Some(Root::Table(at)) if *at == handle) { return; }
         set(self.roots(compute), slot, Root::Table(handle));
     }
 
     pub(crate) fn set_view(&mut self, compute: bool, slot: u32, address: u64) {
+        if matches!(self.roots_ref(compute).get(slot as usize), Some(Root::View(at)) if *at == address) { return; }
         set(self.roots(compute), slot, Root::View(address));
     }
 
     pub(crate) fn set_constants(&mut self, compute: bool, slot: u32, values: &[u32], offset: u32) {
+        if let Some(Root::Constants(c)) = self.roots_ref(compute).get(slot as usize)
+            && c.get(offset as usize..offset as usize + values.len()) == Some(values) { return; }
         let roots = self.roots(compute);
         let s = slot as usize;
         if !matches!(roots.get(s), Some(Root::Constants(_))) {
@@ -897,6 +935,7 @@ impl State {
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        self.dirty_tables();
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -1007,10 +1046,20 @@ impl State {
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages of the root views the list has set made ready.
     fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+        #[cfg(feature = "resource-detail")]
+        let _resource = crate::resource_cost::Scope::new(2);
+        #[cfg(feature = "diagnostics")]
+        let _cost = crate::list::record_cost::Scope::new(3);
+        #[cfg(feature = "resource-detail")]
+        let heap_cost = crate::resource_cost::Scope::new(8);
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
         }?;
+        #[cfg(feature = "resource-detail")]
+        drop(heap_cost);
+        #[cfg(feature = "resource-detail")]
+        let roots_cost = crate::resource_cost::Scope::new(9);
         let (mut addresses, mut constants) = (Vec::new(), Vec::new());
         for root in self.roots_ref(compute) {
             match root {
@@ -1019,6 +1068,8 @@ impl State {
                 _ => {}
             }
         }
+        #[cfg(feature = "resource-detail")]
+        drop(roots_cost);
         crate::memory::ready(list, heap, &addresses, &constants, writes)
     }
 
@@ -1039,6 +1090,8 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let _cost = crate::list::record_cost::Scope::new(5);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -1134,6 +1187,8 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let _cost = crate::list::record_cost::Scope::new(2);
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -1370,6 +1425,8 @@ impl State {
         compute: bool,
         writes: bool,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let _cost = crate::list::record_cost::Scope::new(3);
         const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let limit = *LIMIT.get_or_init(|| {
@@ -1481,6 +1538,8 @@ impl State {
         compute: bool,
         biased: bool,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let _cost = crate::list::record_cost::Scope::new(3);
         let heap = match self.heaps[0] {
             0 => None,
             h => Some(crate::descriptor::heap(h as This)),
@@ -1562,6 +1621,8 @@ impl State {
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
+        #[cfg(feature = "diagnostics")]
+        let _cost = crate::list::record_cost::Scope::new(3);
         let heap = self
             .heaps
             .iter()
@@ -1886,6 +1947,8 @@ impl State {
     /// title's bake programs. The uploads are recorded into `list` ahead
     /// of the draw being bound, as the world's pass records them.
     fn early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
+        #[cfg(feature = "diagnostics")]
+        let _cost = crate::list::record_cost::Scope::new(4);
         let (early_ms, bake_ms) = early_budgets();
         if compute || (early_ms == 0 && bake_ms == 0) {
             return;
@@ -2402,6 +2465,8 @@ impl State {
     /// prepared (`HostList::gather_wrote`), and whole only for a pipeline
     /// the layer does not know.
     fn gather_ends(&self, list: &HostList, stores: bool) {
+        #[cfg(feature = "record-detail")]
+        let _gather_cost = crate::list::record_cost::Scope::new(9);
         if !stores {
             return;
         }
@@ -2430,6 +2495,8 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        #[cfg(feature = "resource-detail")]
+        let _resource_root = crate::resource_cost::Root::new(0);
         // It may write the arguments a window holds clamped.
         self.window = None;
         self.gather_ends(list, true);
@@ -2484,7 +2551,11 @@ impl State {
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        unsafe {
+            #[cfg(feature = "diagnostics")]
+            let _cost = crate::list::record_cost::Scope::new(6);
+            list.list.Dispatch(x, y, z)
+        };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2755,7 +2826,11 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
+                    unsafe {
+                        #[cfg(feature = "diagnostics")]
+                        let _cost = crate::list::record_cost::Scope::new(6);
+                        l6.DispatchMesh(x, 1, 1)
+                    };
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -2883,6 +2958,41 @@ impl State {
         indexed: &[RootIndexedView],
         compute: bool,
     ) -> Vec<(u8, u32)> {
+        #[cfg(feature = "diagnostics")]
+        let mut _cost = crate::list::record_cost::Scope::new(1);
+        // Dependencies: graphics/compute root tables AND indexed root constants,
+        // heap identity, shader used/indexed layout, descriptor words and view
+        // generations. API writes/copies/forget bump atomic descriptor epochs;
+        // raw title memcpy bypasses APIs, so compare saved records before reuse.
+        // State's list mutex owns this cache; reset/cut/release invalidate it.
+        // Keep mirror/readable on hits: host views, mappings, uploads, barriers,
+        // depth feedback and STORES/UAV tracking can change without a bind.
+        let enabled = tables_cache();
+        let descriptors = crate::descriptor::table_versions();
+        if enabled && self.table_descriptors != descriptors {
+            if self.table_descriptors.1 != descriptors.1 { self.fresh_tables.clear(); }
+            self.dirty_tables();
+            self.table_descriptors = descriptors;
+        }
+        if enabled && let Some(c) = self.tables_cache.iter().find(|c|
+            c.version == self.tables_version && c.compute == compute && c.used == used && c.indexed == indexed)
+        {
+            if c.records.iter().all(|&(at, words)| crate::descriptor::record_at(at) == words) {
+                #[cfg(feature = "diagnostics")]
+                _cost.tables(true);
+                for u in used.iter().filter(|u| u.root == RootType::Table && !c.fresh.contains(&u.slot)) {
+                    self.table_entry(list, u, compute);
+                }
+                for &(at, kind) in &c.reads {
+                    if let Some(view) = crate::descriptor::view(at) { readable(list, kind, &view); }
+                }
+                return c.made.clone();
+            }
+            self.dirty_tables(); // An uninstrumented descriptor write.
+        }
+        #[cfg(feature = "diagnostics")]
+        _cost.tables(false);
+        let (mut records, mut reads) = (Vec::new(), Vec::new());
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -2913,6 +3023,7 @@ impl State {
         }
         fresh.sort_unstable();
         fresh.dedup();
+        let cached_fresh = if enabled { fresh.clone() } else { Vec::new() };
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
@@ -2969,15 +3080,29 @@ impl State {
             }
             // The table and what its entries hold (record words).
             let key = {
+                #[cfg(feature = "diagnostics")]
+                let _cost = crate::list::record_cost::Scope::new(0);
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    let words = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                    words.hash(&mut h);
+                    if enabled { records.push((at, words)); }
                 }
                 (table, n, h.finish())
             };
+            if enabled {
+                reads.extend(entries.iter().filter(|u| u.kind != ResourceType::Cbv)
+                    .map(|u| (table + u64::from(u.table_offset_dwords) * 4, u.kind)));
+                for &k in &selected {
+                    let at = table + u64::from(k) * 32;
+                    if !entries.iter().any(|u| u.table_offset_dwords / 8 == k)
+                        && let Some(kind) = crate::descriptor::view(at).as_ref().and_then(view_kind)
+                    { reads.push((at, kind)); }
+                }
+            }
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -3056,6 +3181,13 @@ impl State {
                 }
             }
             made.push((slot, first * 32));
+        }
+        if enabled && made.len() == cached_fresh.len() && made.iter().all(|m| m.1 != u32::MAX)
+            && descriptors == crate::descriptor::table_versions()
+        {
+            self.tables_cache.push(TablesCache { version: self.tables_version, compute,
+                used: used.to_vec(), indexed: indexed.to_vec(), fresh: cached_fresh,
+                made: made.clone(), records, reads });
         }
         made
     }
@@ -3154,6 +3286,8 @@ impl State {
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             // SAFETY: an open list with everything set.
             unsafe {
+                #[cfg(feature = "diagnostics")]
+                let _cost = crate::list::record_cost::Scope::new(6);
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
@@ -3256,6 +3390,8 @@ impl State {
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
             unsafe {
+                #[cfg(feature = "diagnostics")]
+                let _cost = crate::list::record_cost::Scope::new(6);
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
@@ -3283,6 +3419,8 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        #[cfg(feature = "resource-detail")]
+        let _resource_root = crate::resource_cost::Root::new(1);
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -3373,6 +3511,8 @@ impl State {
         // buffer. Anything else ends the window: it uses the scratch buffer
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
+        #[cfg(feature = "record-detail")]
+        let window_cost = crate::list::record_cost::Scope::new(11);
         let offset = args.offset(arguments);
         let windowed = windows()
             && kind != DISPATCH
@@ -3576,6 +3716,8 @@ impl State {
         {
             self.last_indirect = (args.id(), offset);
         }
+        #[cfg(feature = "record-detail")]
+        drop(window_cost);
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -3596,6 +3738,8 @@ impl State {
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
+            #[cfg(feature = "diagnostics")]
+            let _cost = crate::list::record_cost::Scope::new(6);
             list.list.ExecuteIndirect(
                 &signature,
                 max,
@@ -3708,14 +3852,36 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
+    #[cfg(feature = "resource-detail")]
+    let _resource = crate::resource_cost::Scope::new(1);
+    #[cfg(feature = "diagnostics")]
+    let _cost = crate::list::record_cost::Scope::new(3);
     const UNORDERED_ACCESS: u32 = 0x8;
+    #[cfg(feature = "resource-detail")]
+    let placed_cost = crate::resource_cost::Scope::new(3);
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
+    #[cfg(feature = "resource-detail")]
+    drop(placed_cost);
+    #[cfg(feature = "resource-detail")]
+    let lookup_cost = crate::resource_cost::Scope::new(4);
+
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+    let copy = crate::descriptor::host::buffer_copy(view);
+    #[cfg(feature = "resource-detail")]
+    drop(lookup_cost);
+    if let Some((shadow, address, len)) = copy {
+        #[cfg(feature = "resource-detail")]
+        let refresh_cost = crate::resource_cost::Scope::new(5);
+
         shadow.refresh(list, address, len);
+        #[cfg(feature = "resource-detail")]
+        drop(refresh_cost);
         if kind == ResourceType::Uav {
+            #[cfg(feature = "resource-detail")]
+            let _writes_cost = crate::resource_cost::Scope::new(6);
+
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
@@ -3729,8 +3895,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             }
         }
     }
+    #[cfg(feature = "resource-detail")]
+    let _texture_cost = crate::resource_cost::Scope::new(7);
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
+            #[cfg(feature = "resource-detail")]
+            let upload_cost = crate::resource_cost::Scope::new(15);
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
@@ -3743,7 +3913,15 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 crate::texture::upload(list, *resource as This, t);
             }
             // A depth texture shaders also write: what they wrote, first.
+            #[cfg(feature = "resource-detail")]
+            drop(upload_cost);
+            #[cfg(feature = "resource-detail")]
+            let twin_cost = crate::resource_cost::Scope::new(16);
             list.twin_use(*resource as This, false, false);
+            #[cfg(feature = "resource-detail")]
+            drop(twin_cost);
+            #[cfg(feature = "resource-detail")]
+            let state_cost = crate::resource_cost::Scope::new(17);
             // The depth target the draw only tests is read in both ways at
             // once: both read states, which its preparation asks for too.
             let (tested, _) = TESTED_DEPTH.get();
@@ -3754,6 +3932,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 SHADER_RESOURCE
             };
             crate::list::ensure_state(list, *resource as This, state);
+            #[cfg(feature = "resource-detail")]
+            drop(state_cost);
+            #[cfg(feature = "resource-detail")]
+            let _debug_cost = crate::resource_cost::Scope::new(18);
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
@@ -3768,10 +3950,16 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             }
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
+            #[cfg(feature = "resource-detail")]
+            let note_cost = crate::resource_cost::Scope::new(19);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             // Some compute-written textures are also read by the title CPU.
             list.texture_written(*resource as This);
+            #[cfg(feature = "resource-detail")]
+            drop(note_cost);
+            #[cfg(feature = "resource-detail")]
+            let _twin_cost = crate::resource_cost::Scope::new(16);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);

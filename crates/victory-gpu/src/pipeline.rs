@@ -475,6 +475,8 @@ pub(crate) fn bound(this: This) {
 /// use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
+    #[cfg(feature = "record-detail")]
+    let _pipeline_cost = crate::list::record_cost::Scope::new(10);
     if this.is_null() {
         return None;
     }
@@ -489,6 +491,8 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 /// comparison of the nine words.
 #[cfg(windows)]
 pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
+    #[cfg(feature = "record-detail")]
+    let _pipeline_cost = crate::list::record_cost::Scope::new(10);
     if this.is_null() {
         return None;
     }
