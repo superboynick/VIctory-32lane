@@ -102,3 +102,62 @@ The world starts around 60 to 72 s in, so only the last 80 s of a 150 s run is w
 Three repeats of the same build gave a coefficient of variation of 2% on `steady.p50`,
 which is the only metric worth reading: the all-run `p50` is pinned at 33.3 ms by the
 title's own 30 fps pacing and shows nothing.
+
+## What actually moved it, in the order it was found
+
+Three settings, each measured against the one before over a 150-second run, world segment only:
+
+| configuration | world p50 | p95 | frames over 1 s | all-run fps |
+|---|---:|---:|---:|---:|
+| room 80, 4K mode, diagnostics build | 507.6 ms | 1,104 ms | 35 | 11.9 |
+| room 80, 1080p, plain build, sweep on | 399.9 ms | 748 ms | 6 | 12.4 |
+| the same, `VICTORY_TEXTURE_SWEEP=0` | 399.9 ms | 748 ms | 6 | 12.4 |
+| plus `VICTORY_TEXTURE_NO_WAIT=1` | **330.0 ms** | **488 ms** | **4** | **15.2** |
+
+Two of these were not performance settings at all as far as anyone knew:
+
+- The **diagnostics build** was used for every earlier measurement. Upstream reports it turns the
+  world into 9 to 12 seconds a frame because it runs a `VirtualQuery` per draw. Our numbers were
+  inflated by it.
+- The title was told it had a **4K display** while the window is 1080p, so it rendered four times
+  the pixels shown.
+
+The one that mattered most is a lock wait, not bandwidth. Texture refresh called
+`waited(2, crate::watch::title_memory_reading)` - it queued behind the title's own mapping changes.
+The step timings said so plainly once they existed:
+
+```
+before   texture_ms = 1100 to 4742 per five-second window
+after    texture_ms =  119 to  142
+```
+
+`VICTORY_TEXTURE_SWEEP=0` is the other half: the sweep released 234 to 1177 host copies of
+title-filled textures every second - 58 to 370 MB - and each was uploaded again later. Keeping them
+cost 10.0 GB of a 12.2 GB card after four minutes, with no out-of-memory and no device loss.
+
+## What was tried and did not work
+
+- `VICTORY_TEXTURE_COMPARE=1` skips unchanged uploads (14 to 57 MB becomes 1 to 9 MB) but the
+  comparison itself costs more than the uploads it saves, 119 ms becoming 2,000 ms, because it
+  compares title memory against a detiled layout rather than against a snapshot of the same layout.
+- `VICTORY_PREFETCH_TEXTURE=1`, `VICTORY_BATCH_GUARDS=1`, a static descriptor grouping, a dirty
+  `tables()` cache, the cool_fox switch set, and `VICTORY_STEP_INDEX=1` all failed to clear the
+  noise floor, and several made p95 worse.
+- `VICTORY_WAVE_FORCE32=1` does **not** revive the four compute pipelines the driver refuses
+  (`0x80070057`), so that refusal is not about lane count.
+
+## Where the remaining time goes
+
+With the settings above, one frame of about 300 ms:
+
+```
+texture steps      119 to 142 ms   (was the whole wall)
+gpu writes         113 to 179 ms   about 60,000 steps per five seconds
+fills              114 to 176 ms   about 120,000 per five seconds
+title copies        59 to 81 ms   160 to 212 MB
+copy-back          117 to 250 ms   waiting for the card's comparison
+on the GPU          61 to 181 ms
+```
+
+The next honest target is the per-step cost of `gpuwrite` and `fill`, and the copy-back wait, not
+the textures.
