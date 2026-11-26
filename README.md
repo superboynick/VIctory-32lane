@@ -66,3 +66,54 @@ cargo build --release -p victory
 A 32-lane host wants `VICTORY_HOST_WAVE=32` for a comparable translation census. Validating a
 census needs `dxil.dll`, which most machines do not have; `VICTORY_DXIL` points at one taken from
 the DXC releases. `docs/diagnosing.md` has the details.
+
+## Reproducing the numbers in this repository
+
+Everything quoted above came from the retail title on a 32-lane NVIDIA host. The commands are
+short; the two things that trip people up are the validator and the wave width.
+
+```
+cargo build --release -p victory
+```
+
+Binding, without starting the title - expect `88 hle, 427 host, 72 title, 0 missing`:
+
+```
+victory run <path to the title executable>
+```
+
+A translation census that is comparable to the numbers in the first table:
+
+```
+# dxil.dll is not present by default; take dxc_<date>.zip from the DXC releases
+set VICTORY_DXIL=<path>\bin\x64\dxil.dll
+set VICTORY_HOST_WAVE=32
+victory translate <shaders.rpf> --validate --pipelines --list
+```
+
+To look at a handful of programs instead of twenty-six thousand, put the sixteen hex digits a log
+names a shader by into `VICTORY_TRANSLATE_ONLY`.
+
+Hitching, which a frame rate of 30 never shows:
+
+```
+set VICTORY_PRESENT_TIMES=out.csv
+set VICTORY_STALL_LOG=100
+victory run <title> --execute
+```
+
+Before starting, check that the archive set is complete and openable - the startup `int3` I chased
+for a day turned out to be one missing archive, and a locked one produces the same breakpoint:
+
+```
+victory check
+```
+
+## State of this branch
+
+Verified on the machine it was built for: binds `88 hle, 427 host, 72 title, 0 missing`, runs the
+title at a steady 30 fps, no crash over repeated runs, and the shader tests pass (227 in the shader
+crate, 106 in HLE, 5 in the app).
+
+Not verified here: anything about AMD hardware, anything about the 72 mesh programs over the output
+component limit, and audio, which I can only describe from measurements rather than by listening.
