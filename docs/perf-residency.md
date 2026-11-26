@@ -161,3 +161,33 @@ on the GPU          61 to 181 ms
 
 The next honest target is the per-step cost of `gpuwrite` and `fill`, and the copy-back wait, not
 the textures.
+
+## Second round: the picture fix, and the tail
+
+The four compute pipelines the driver refused turned out not to be a root signature problem - six
+signature variants were refused with the same code - nor a lane-count problem. The pipeline state
+validation part carried the container's declared wave size through, so a console shader that
+declares 64 asked a 32-lane device for 64-lane waves. Leaving the declaration out
+(`VICTORY_PSV_WAVE32=1`) creates all four, including the alpha transmission prefilter whose absence
+hazes the screen, and pipeline creation failures in a 240-second run went from 6 to 0.
+
+Frame rate did not move: at 5,000 draws a frame it stays at about 3 fps. It is a picture fix.
+
+Two settings then moved the tail rather than the median, over three 150-second runs each
+(baseline p50 365.9 ms, p95 602 ms, 55 long frames):
+
+| added | p50 | p95 | p99 | long frames |
+|---|---:|---:|---:|---:|
+| `VICTORY_COPY_PLAIN=1` | 374.2 | **482.6** | **593.9** | **40** |
+| plus `VICTORY_WIDE_BACK=1` | 362.4 | 537.7 | 684.3 | 44 |
+
+`COPY_PLAIN` replaces the kernel's copy of title memory (`ReadProcessMemory`, about 3 GB/s) with a
+guard-page-protected `rep movsb`, which is what upstream's own file says is three times faster. The
+median is unmoved because the median frame is not the one doing large copies; the long frames are.
+
+Three further switches - `VIEW_INLINE`, `ROOT_SRV_DIRECT`, `LOOKUP_CACHE` - were tried and none
+cleared the noise floor on p50 (370, 372, 378 ms against 362), though `LOOKUP_CACHE` did cut long
+frames from 44 to 36.
+
+Running total for the world segment: **507.6 ms to about 362 ms, about 29 per cent**, with long
+frames from 101 to about 40.
