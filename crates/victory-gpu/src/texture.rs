@@ -11,6 +11,8 @@
 //! submission that samples it.
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
+//! `VICTORY_TEXTURE_PARTIAL_UPLOAD=1` (default off) limits subsequent GPU
+//! copies to row runs of changed source pages; reads/detiling remain whole.
 //! Only textures read through descriptor tables are brought up to date
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
@@ -73,6 +75,71 @@ pub(crate) struct Staging {
     /// buffers and goes back to it ([`staging_buffer`]); 0: a buffer of its
     /// own, released when this is dropped.
     pooled: u64,
+    partial: Option<Mutex<PartialUpload>>,
+}
+
+/// Source pages, not footprint pages: hashing also catches writes through aliases.
+#[derive(Default)]
+struct PartialUpload {
+    hashes: Vec<blake3::Hash>,
+    dirty: Vec<bool>,
+    version: u64,
+}
+
+impl PartialUpload {
+    fn changed(&mut self, start: usize, tiled: &[u8]) {
+        let mut hashes = Vec::new();
+        let mut at = 0;
+        while at < tiled.len() {
+            let end = (at + crate::watch::PAGE - (start + at) % crate::watch::PAGE).min(tiled.len());
+            hashes.push(blake3::hash(&tiled[at..end]));
+            at = end;
+        }
+        self.dirty.resize(hashes.len(), false);
+        for (i, hash) in hashes.iter().enumerate() {
+            self.dirty[i] |= self.hashes.get(i) != Some(hash);
+        }
+        self.hashes = hashes;
+        self.version += 1;
+    }
+
+    fn uploaded(&mut self, version: u64) -> bool {
+        if self.version != version { return false; }
+        self.dirty.fill(false);
+        true
+    }
+}
+
+/// Half-open element-row runs. Tiled pages conservatively cover whole tile rows;
+/// linear rows use the console pitch, never the D3D12 upload footprint pitch.
+fn dirty_rows(layout: &victory_formats::texture::Layout, mip: u32, slice: u32, start: usize, pages: &[bool]) -> Option<Vec<(u32, u32)>> {
+    use victory_formats::texture::Swizzle;
+    let m = layout.mips.get(mip as usize)?;
+    let linear = layout.desc.swizzle == Swizzle::LINEAR;
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for y in 0..m.height {
+        let mut dirty = false;
+        for x in (0..m.width).step_by(if linear { m.width as usize } else { layout.block[0] as usize }) {
+            let offset = layout.offset(mip, x, y, slice).ok()? as usize;
+            let (offset, len) = if linear { (offset, m.width as usize * layout.desc.element_bytes as usize) }
+                else { (offset & !(layout.alignment as usize - 1), layout.alignment as usize) };
+            let first = start % crate::watch::PAGE + offset;
+            dirty |= (first / crate::watch::PAGE..(first + len).div_ceil(crate::watch::PAGE))
+                .any(|p| pages.get(p).copied().unwrap_or(true));
+            if dirty { break; }
+        }
+        if dirty {
+            match runs.last_mut() {
+                Some((_, end)) if *end == y => *end = y + 1,
+                _ => runs.push((y, y + 1)),
+            }
+        }
+    }
+    Some(runs)
+}
+
+fn worth_partial(runs: &[(u32, u32)], rows: u32) -> bool {
+    runs.len() <= 8 && runs.iter().map(|&(a, b)| u64::from(b - a)).sum::<u64>() * 10 < u64::from(rows) * 7
 }
 
 /// A staging buffer nothing holds: the buffer and where it is mapped.
@@ -742,6 +809,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     crate::framelog::add(crate::framelog::T::Uploads, 1);
+    let partial = staging.partial.as_ref().map(|p| {
+        let p = p.lock().unwrap_or_else(|e| e.into_inner());
+        (p.version, p.dirty.clone())
+    });
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
@@ -790,8 +861,27 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
                 PlacedFootprint: *footprint,
             },
         };
-        // SAFETY: an open list; both locations name live resources.
-        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        let f = footprint.Footprint;
+        let runs = partial.as_ref().filter(|_| staging.uploaded.load(Relaxed)).and_then(|(_, pages)| {
+            dirty_rows(&staging.layout, i as u32 % staging.mips, i as u32 / staging.mips, staging.memory as usize, pages)
+        }).filter(|runs| worth_partial(runs, staging.rows[i]));
+        if let Some(runs) = runs {
+            let copied: u32 = runs.iter().map(|&(a, b)| b - a).sum();
+            let row_bytes = u64::from(f.Width.div_ceil(staging.layout.desc.block)) * u64::from(staging.layout.desc.element_bytes);
+            crate::framelog::add(crate::framelog::T::TexturePartial, u64::from(!runs.is_empty()));
+            crate::framelog::add(crate::framelog::T::TextureSkippedBytes, u64::from(staging.rows[i] - copied) * row_bytes);
+            for (first, end) in runs {
+                let top = first * staging.layout.desc.block;
+                let region = D3D12_BOX { left: 0, top, front: 0, right: f.Width,
+                    bottom: (end * staging.layout.desc.block).min(f.Height), back: 1 };
+                // SAFETY: whole texel/block rows inside this single-sampled colour subresource.
+                unsafe { list.list.CopyTextureRegion(&to, 0, top, 0, &from, Some(&region)) };
+            }
+        } else {
+            crate::framelog::add(crate::framelog::T::TextureFull, 1);
+            // SAFETY: an open list; both locations name live resources.
+            unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        }
     }
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
@@ -800,7 +890,12 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         let staging = staging.clone();
         list.defer_host(move || {
             staging.uploaded.store(true, Relaxed);
-            staging.dirty.store(false, Relaxed);
+            // A refresh since recording may have changed rows this list does not copy.
+            let complete = match (&staging.partial, &partial) {
+                (Some(state), Some((version, _))) => state.lock().unwrap_or_else(|e| e.into_inner()).uploaded(*version),
+                _ => true,
+            };
+            staging.dirty.store(!complete, Relaxed);
         });
     }
     // Levels on demand (`crate::tiles`): after the check below, in the
@@ -1187,6 +1282,9 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(partial) = &self.partial {
+            partial.lock().unwrap_or_else(|e| e.into_inner()).changed(self.memory as usize, tiled);
+        }
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1228,6 +1326,9 @@ impl Staging {
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
+                if let Some(partial) = &self.partial {
+                    partial.lock().unwrap_or_else(|e| e.into_inner()).dirty.fill(true);
+                }
                 return;
             }
         }
@@ -1490,6 +1591,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    let partial = (std::env::var_os("VICTORY_TEXTURE_PARTIAL_UPLOAD").is_some_and(|v| v == "1")
+        && !on_demand && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.SampleDesc.Count == 1
+        && !d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)).then(Mutex::<PartialUpload>::default);
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -1541,6 +1645,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
         pooled,
+        partial,
     });
     map.insert(resource as usize, s.clone());
     Some(s)
@@ -1549,6 +1654,54 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn partial_upload_rows_and_versions() {
+        use super::{PartialUpload, dirty_rows, worth_partial};
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let desc = Desc { dimension: Dimension::Tex2d, width: 256, height: 192, depth: 1,
+            mips: 1, element_bytes: 4, block: 1, samples: 1, swizzle: Swizzle::LINEAR };
+        let layout = Layout::new(&desc).unwrap();
+        assert_eq!(layout.mips[0].pitch * 4, 1024);
+        let rows = |pages: &[bool]| dirty_rows(&layout, 0, 0, 0, pages).unwrap();
+        assert_eq!(rows(&[true, false, false]), [(0, 64)]);
+        assert_eq!(rows(&[false, false, true]), [(128, 192)]);
+        assert_eq!(rows(&[true; 3]), [(0, 192)]);
+        assert!(rows(&[false; 3]).is_empty());
+        assert_eq!(dirty_rows(&layout, 0, 0, 1, &[false, true, false, false]).unwrap(), [(63, 128)]);
+        assert!(worth_partial(&[(0, 69)], 100));
+        assert!(!worth_partial(&[(0, 70)], 100));
+        assert!(!worth_partial(&[(0, 192)], 192));
+        assert!(worth_partial(&[], 192));
+        // Tiled, BC, mip-tail and array mappings must contain every changed element's row.
+        for swizzle in [Swizzle::SW_256B_S, Swizzle::SW_4KB_S, Swizzle::SW_64KB_D] {
+            let l = Layout::new(&Desc { width: 513, height: 517, depth: 2, mips: 5,
+                element_bytes: 16, block: 4, swizzle, ..desc }).unwrap();
+            let mut pages = vec![false; (l.size as usize + 13).div_ceil(crate::watch::PAGE)];
+            pages[1] = true;
+            for slice in 0..2 { for mip in 0..5 {
+                let runs = dirty_rows(&l, mip, slice, 13, &pages).unwrap();
+                let m = l.mips[mip as usize];
+                for y in 0..m.height { for x in 0..m.width {
+                    let a = 13 + l.offset(mip, x, y, slice).unwrap() as usize;
+                    if (a / crate::watch::PAGE..(a + 16).div_ceil(crate::watch::PAGE)).any(|p| pages[p]) {
+                        assert!(runs.iter().any(|&(first, end)| first <= y && y < end));
+                    }
+                }}
+            }}
+        }
+        let mut state = PartialUpload::default();
+        let mut bytes = vec![0; 3 * crate::watch::PAGE];
+        state.changed(0, &bytes);
+        assert!(state.uploaded(state.version));
+        bytes[0] = 1;
+        state.changed(0, &bytes);
+        let recorded = state.version;
+        *bytes.last_mut().unwrap() = 1;
+        state.changed(0, &bytes);
+        assert!(!state.uploaded(recorded)); // A stale recorded list cannot discard later changes.
+        assert_eq!(state.dirty, [true, false, true]);
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does

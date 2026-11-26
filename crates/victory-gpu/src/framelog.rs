@@ -57,6 +57,8 @@ pub enum T {
     /// (nanoseconds, calls). Diagnostics builds only.
     RecordNs,
     RecordCalls,
+    TablesHit,
+    TablesMiss,
     /// The runtime changing what title memory shows: calls, the time from
     /// asking for the lock to letting it go, and of that the wait for
     /// readers.
@@ -68,6 +70,10 @@ pub enum T {
     RefreshUs,
     RefreshStillUs,
     Uploads,
+    /// Subresource uploads and skipped payload bytes (excluding row padding).
+    TextureFull,
+    TexturePartial,
+    TextureSkippedBytes,
     /// Waiting for host pipelines being made.
     PipelineWaitUs,
     /// Writes taken by the guards on view memory.
@@ -415,8 +421,8 @@ fn text(f: &Frame) -> String {
          {:.1} ms (user {:.1}, kernel {:.1}); {:.0} submissions, preparing {:.1}, waiting for the card {:.1}; copies {:.1} \
          ms {:.1} MB; copy-back {:.1} ms {:.2} MB | card: idle {:.1} ms ({:.1} behind us); by its own clock, of the lists of a moment ago: our \
          send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
-         recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
-         still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
+         recording, all threads: {:.1} ms in {:.0} calls; tables hit {tables_hit:.0} miss {tables_miss:.0}; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
+         still), {:.0} uploads (subresources full {texture_full:.0} partial {texture_partial:.0}, skipped {texture_skipped:.0} bytes), staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
          readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
          draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
@@ -478,6 +484,8 @@ fn text(f: &Frame) -> String {
         t(T::WorkerLooks),
         t(T::RecordSlow),
         t(T::RecordLooks),
+        tables_hit = t(T::TablesHit), tables_miss = t(T::TablesMiss),
+        texture_full = t(T::TextureFull), texture_partial = t(T::TexturePartial), texture_skipped = t(T::TextureSkippedBytes),
     )
 }
 
@@ -583,6 +591,12 @@ pub fn frame() {
             // Another thread presented: its processor time is not this frame's.
             (f.s[S_THREAD_USER], f.s[S_THREAD_KERNEL]) = (0.0, 0.0);
         }
+        #[cfg(feature = "diagnostics")]
+        if crate::list::record_profiling() {
+            tracing::info!(frame = f.number, at = f.at, frame_us = f.us,
+                record_ns = f.t[T::RecordNs as usize], record_calls = f.t[T::RecordCalls as usize],
+                tables_hit = f.t[T::TablesHit as usize], tables_miss = f.t[T::TablesMiss as usize], "record frame");
+        }
         state.frames.push(f);
     }
     let elapsed = state.since.elapsed();
@@ -613,6 +627,9 @@ mod tests {
         let mut f = Frame { number, at: number as f64, us: ms * 1e3, t: [0.0; N], s: [0.0; S], h: [0.0; HN] };
         f.t[T::PresentUs as usize] = ms * 100.0;
         f.t[T::Uploads as usize] = ms;
+        f.t[T::TextureFull as usize] = 3.0;
+        f.t[T::TexturePartial as usize] = 2.0;
+        f.t[T::TextureSkippedBytes as usize] = 65536.0;
         f
     }
 
@@ -630,6 +647,7 @@ mod tests {
         assert!(out[2].starts_with("long frame 3 at 3.0 s: 400 ms |"), "{}", out[2]);
         assert!(out[2].contains("in the present call 40.0 "), "{}", out[2]);
         assert!(out[2].contains(" 400 uploads"), "{}", out[2]);
+        assert!(out[2].contains("subresources full 3 partial 2, skipped 65536 bytes"), "{}", out[2]);
     }
 
     #[test]
