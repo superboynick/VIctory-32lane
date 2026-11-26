@@ -117,3 +117,38 @@ crate, 106 in HLE, 5 in the app).
 
 Not verified here: anything about AMD hardware, anything about the 72 mesh programs over the output
 component limit, and audio, which I can only describe from measurements rather than by listening.
+
+## The flicker this fork had, and how it was measured
+
+Worth writing down because the title was blamed for it first, and because the measurement method
+matters more than the fix.
+
+Symptom: the opening animation flickered, with a black frame between every visible frame. Back
+buffer captures of consecutive frames were steady - 0.04 to 0.25 average difference between
+neighbours - so the rendered content was never the problem, and every capture-based check said the
+picture was fine.
+
+What found it was capturing the **composed desktop**, not the swap chain: `ddagrab` (Desktop
+Duplication) at 60 fps over the window region, six seconds, then the mean luminance of every frame.
+
+```
+two Present calls per frame   343 of 360 frames black, content one frame in six
+one Present call per frame      0 of 360 frames black, steady content
+```
+
+The cause was a second `Present` in the frame path, left over from merging my sync-interval change
+with upstream's error-reporting call. The second call flipped to the buffer that had not been drawn
+into, so every other visible frame was an empty surface. Upstream has one call, and so did every
+branch I opened there; the duplicate existed only here.
+
+Two switches stay, for machines that still show something and need to try the other way without a
+rebuild - neither is set by default:
+
+```
+VICTORY_SWAP_BUFFERS=3        three buffers instead of two
+VICTORY_SWAP_EFFECT=discard   the bitblt model instead of flip
+```
+
+For anyone chasing something similar: a capture of the swap chain answers "what did the title
+draw", and a capture of the composed desktop answers "what did the screen show". They disagreed
+here by a wide margin, and only the second one reproduces what a person watching the monitor sees.
