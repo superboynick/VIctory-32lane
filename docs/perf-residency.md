@@ -191,3 +191,30 @@ frames from 44 to 36.
 
 Running total for the world segment: **507.6 ms to about 362 ms, about 29 per cent**, with long
 frames from 101 to about 40.
+
+## Comparing two runs that loaded different scenes
+
+The three-run repeats gave a coefficient of variation of two per cent on the median, which is what
+the benchmark claims, but comparing two *different* builds turned out to be noisier: one run reached
+the world at 60 s with 1,000 draws a frame, another at 105 s with 5,300. The median of the whole
+world segment then says more about which part of the city each run happened to load than about the
+change being measured.
+
+The fix is to only compare five-second window lines whose draw count falls in the same band:
+
+```
+F:\bench\band.ps1 -Tag @("before","after") -DrawLow 3000 -DrawHigh 6000
+```
+
+With that, the four settings of this whole investigation, at 3,000 to 6,000 draws a frame:
+
+| configuration | p50 in band | samples |
+|---|---:|---:|
+| start (4K mode, diagnostics build, sweep on) | 571 ms | 3 |
+| plus the two texture settings | 369 ms | 6 |
+| the same on the current build | 394 ms | 6 |
+| plus the wave32 pipeline fix | 413 ms | 11 |
+
+So the frame time fell about **28 per cent** at equal draw counts, and the picture fix - the four
+compute pipelines now being created - costs about **five per cent**. That is the trade worth knowing:
+the haze is gone for roughly one frame in twenty.
