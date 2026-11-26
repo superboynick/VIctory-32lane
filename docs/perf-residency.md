@@ -218,3 +218,26 @@ With that, the four settings of this whole investigation, at 3,000 to 6,000 draw
 So the frame time fell about **28 per cent** at equal draw counts, and the picture fix - the four
 compute pipelines now being created - costs about **five per cent**. That is the trade worth knowing:
 the haze is gone for roughly one frame in twenty.
+
+## Correction: the render resolution does not matter here
+
+Earlier notes in this file credited part of the gain to rendering at 1080p instead of 4K. That was
+never measured, and measuring it now says the opposite: 720p, 900p, 1080p and 4K all land within
+noise of each other, 395 to 416 ms, at 3,000 to 6,000 draws a frame.
+
+```
+1600x900   407 ms   n=13
+1920x1080  395 ms   n=12
+1280x720   416 ms   n=10
+3840x2160  402 ms   n=11
+```
+
+The reason is visible in the same runs: this title is not limited by pixels. Its frames cost about
+seventy microseconds a draw, so 5,000 draws take 350 ms whether the pixels number one million or
+eight. Cutting the resolution buys nothing.
+
+The swap chain is 3840 by 2160 in every case, whatever is reported to the title - that is a separate
+thing worth knowing, and it means the present copies a 4K surface into a 1080p window.
+
+So the settings that did move this frame time are the two texture ones, and the picture fix; not the
+display mode.
