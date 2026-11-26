@@ -22,6 +22,9 @@ tempfile.workspace = true
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
+# Opt-in CPU scope instrumentation; absent even from ordinary diagnostics.
+record-detail = ["diagnostics"]
+resource-detail = ["diagnostics"]
 
 [lints]
 workspace = true

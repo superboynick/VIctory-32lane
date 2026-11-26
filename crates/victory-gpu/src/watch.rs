@@ -39,6 +39,53 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
+pub(crate) fn batch_guards() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BATCH_GUARDS").is_some_and(|v| v == "1"))
+}
+
+/// Exact union of byte ranges, capped per operation; never include gaps.
+pub(crate) fn guard_runs(mut ranges: Vec<(usize, usize)>, limit: usize) -> Vec<(usize, usize)> {
+    assert!(limit > 0);
+    ranges.retain(|&(at, n)| n != 0 && at.checked_add(n).is_some());
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (at, n) in ranges {
+        if let Some(last) = merged.last_mut().filter(|last| at <= last.0 + last.1) {
+            last.1 = (at + n).max(last.0 + last.1) - last.0;
+        } else { merged.push((at, n)); }
+    }
+    let mut out = Vec::new();
+    for (mut at, mut n) in merged {
+        while n != 0 {
+            let take = n.min(limit);
+            out.push((at, take));
+            at += take;
+            n -= take;
+        }
+    }
+    out
+}
+
+/// One current region only: no cache survives an operation or a remapping.
+/// Returns its clipped length and committed protection (zero if unconfirmed).
+pub(crate) fn guard_region(at: usize, len: usize) -> (usize, u32) {
+    use windows_sys::Win32::System::Memory::*;
+    // SAFETY: valid local output; the kernel inspects, never dereferences `at` here.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let result = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    crate::framelog::add(crate::framelog::T::GuardQueries, 1);
+    let n = (info.BaseAddress as usize).saturating_add(info.RegionSize).saturating_sub(at).min(len);
+    if result != size_of_val(&info) || n == 0 { batch_guard_failed(); return (len, 0); }
+    crate::framelog::add(crate::framelog::T::GuardBytes, n as u64);
+    (n, if info.State == MEM_COMMIT { info.Protect } else { 0 })
+}
+
+pub(crate) fn batch_guard_failed() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::warn!("batch guard operation failed; using the original piecewise path"));
+}
+
 /// A title-memory range whose changed pages another subsystem needs to read.
 pub(crate) struct Tracked {
     start: usize,
@@ -549,6 +596,7 @@ fn failed_asking(start: usize, end: usize) {
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
+    crate::framelog::add(crate::framelog::T::GuardQueries, 1);
     let (protected, clean, absent, viewed, aliased) = {
         let g = guards();
         let b = start / BLOCK;
@@ -1363,6 +1411,7 @@ fn is_view(start: usize, end: usize) -> bool {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        crate::framelog::add(crate::framelog::T::GuardQueries, 1);
         if n == 0 {
             return false;
         }
@@ -1483,13 +1532,15 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         note(g, from, to);
         return;
     }
+    let mut absent_to = from;
     for block in from..to {
         if set(block, block + 1) {
             note(g, block, block + 1);
         } else {
             #[cfg(feature = "diagnostics")]
             let error = std::io::Error::last_os_error();
-            if block < uncommitted_end(block) {
+            if !batch_guards() || block >= absent_to { absent_to = uncommitted_end(block); }
+            if block < absent_to {
                 g.absent.insert(block);
             } else {
                 // Diagnostics: a committed block that will not be made
@@ -1516,6 +1567,7 @@ fn uncommitted_end(block: usize) -> usize {
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    crate::framelog::add(crate::framelog::T::GuardQueries, 1);
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
         (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
     } else {
@@ -1565,15 +1617,33 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
-    for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
-        // Before the block can be written ([`PUBLISHED`]; nothing to do
-        // where no bit was ever set).
-        PUBLISHED.clear(block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+    let ranges = if batch_guards() {
+        guard_runs(blocks.iter().map(|&b| (b * BLOCK, BLOCK)).collect(), 16 << 20)
+    } else { blocks.iter().map(|&b| (b * BLOCK, BLOCK)).collect() };
+    for (at, len) in ranges {
+        for block in at / BLOCK..(at + len) / BLOCK {
+            g.protected.remove(&block);
+            g.clean.remove(&block);
+            // Before these blocks can be written; also invalidates the light path.
+            PUBLISHED.clear(block);
+        }
+        if len > BLOCK {
+            let (n, protection) = guard_region(at, len);
+            let mut old = 0;
+            if n == len && protection == windows_sys::Win32::System::Memory::PAGE_READONLY {
+                // SAFETY: all these blocks were guarded by us, within one queried region.
+                if unsafe { VirtualProtect(at as *const _, len, PAGE_READWRITE, &mut old) } != 0 {
+                    crate::framelog::add(crate::framelog::T::BatchedRuns, 1);
+                    continue;
+                }
+                batch_guard_failed();
+            }
+        }
+        for block in at / BLOCK..(at + len) / BLOCK {
+            let mut old = 0;
+            // SAFETY: a block we made read-only.
+            unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        }
     }
     !blocks.is_empty()
 }
@@ -1872,6 +1942,7 @@ fn install() {
     // The switch is read here, not first in the handler ([`open`] asks
     // it): reading the environment allocates.
     light_kept();
+    batch_guards(); // Initialize outside the exception handler.
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
@@ -1887,12 +1958,20 @@ fn writable(at: usize) -> bool {
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    crate::framelog::add(crate::framelog::T::GuardQueries, 1);
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn guard_ranges_merge_and_split_exactly() {
+        assert_eq!(guard_runs(vec![(8, 8), (0, 8), (4, 8), (19, 0), (20, 2)], 10), [(0, 10), (10, 6), (20, 2)]);
+        assert!(guard_runs(vec![(0, 0), (usize::MAX, 1)], 8).is_empty());
+        assert!(guard_runs(vec![], 8).is_empty());
+        assert_eq!(guard_runs(vec![(3, 24)], 8), [(3, 8), (11, 8), (19, 8)]);
+    }
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
@@ -1984,6 +2063,8 @@ mod tests {
             guard(view, view + 2 * BLOCK),
             Some((view / PAGE..view / PAGE + 1).collect())
         );
+        writing(view, 2 * BLOCK);
+        assert_eq!(guard(view, view + 2 * BLOCK), Some((view / PAGE..view / PAGE + 2).collect()));
         // SAFETY: our view.
         unsafe {
             UnmapViewOfFile(

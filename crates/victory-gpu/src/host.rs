@@ -961,6 +961,28 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn batched_writes_preserve_holes_and_readonly_pages() {
+        use windows_sys::Win32::System::Memory::*;
+        const M: usize = 1 << 20;
+        // SAFETY: private reservation; only committed pages are read directly.
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 3 * M, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!p.is_null());
+            for offset in [0, 2 * M] {
+                assert_eq!(VirtualAlloc(p.add(offset).cast(), M, MEM_COMMIT, PAGE_READWRITE), p.add(offset).cast());
+            }
+            let src = vec![0x5a; 3 * M];
+            super::write_mapped(p, src.as_ptr(), src.len());
+            for offset in [0, 2 * M] { assert!(std::slice::from_raw_parts(p.add(offset), M).iter().all(|&b| b == 0x5a)); }
+            let mut old = 0;
+            assert_ne!(VirtualProtect(p.cast(), M, PAGE_READONLY, &mut old), 0);
+            super::write_mapped(p, vec![0x77; 3 * M].as_ptr(), 3 * M);
+            assert_eq!(*p, 0x5a);
+            assert_eq!(*p.add(2 * M), 0x77);
+            assert_ne!(VirtualFree(p.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+    #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 5 << 16;
@@ -4156,6 +4178,46 @@ mod late_tests {
             assert_eq!(touches(&ranges, from, to), hit, "{from}..{to}");
         }
         assert!(!touches(&[], 0, usize::MAX));
+    }
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "GPU readback microbenchmark"]
+fn bench_fetch_buffers() {
+    let host = host().expect("D3D12 required");
+    const LEN: usize = 64 << 20;
+    let (upload, source) = host.upload_buffer(LEN as u64).unwrap();
+    unsafe { for i in 0..LEN { source.add(i).write((i.wrapping_mul(31) ^ (i >> 16)) as u8); } }
+    let gpu = host.uav_buffer(LEN as u64).unwrap();
+    let init = host.new_list().unwrap();
+    unsafe { init.list.CopyBufferRegion(&gpu, 0, &upload, 0, LEN as u64); }
+    init.close();
+    host.execute(&[&init]);
+    for readback in [false, true] {
+        let (buffer, data) = if readback {
+            let buffer = host.read_back_buffer(LEN as u64).unwrap();
+            let mut data = std::ptr::null_mut();
+            unsafe { buffer.Map(0, None, Some(&mut data)).unwrap(); }
+            (buffer, data.cast::<u8>())
+        } else { host.shared_buffer(LEN as u64).unwrap() };
+        for step in [64 << 10, LEN] {
+            let mut times = Vec::new();
+            for _ in 0..9 {
+                let list = host.new_list().unwrap();
+                let start = std::time::Instant::now();
+                for at in (0..LEN).step_by(step) {
+                    unsafe { list.list.CopyBufferRegion(&buffer, at as u64, &gpu, at as u64, step as u64); }
+                }
+                let record = start.elapsed().as_secs_f64() * 1e3;
+                list.close();
+                host.execute(&[&list]);
+                times.push((start.elapsed().as_secs_f64() * 1e3, record));
+                unsafe { assert_eq!(std::slice::from_raw_parts(source, LEN), std::slice::from_raw_parts(data, LEN)); }
+            }
+            times.sort_by(|a,b| a.0.total_cmp(&b.0));
+            eprintln!("readback={readback} copies={} total={:.3} ms record={:.3} ms; all bytes equal", LEN / step, times[4].0, times[4].1);
+        }
     }
 }
 
@@ -7479,6 +7541,9 @@ impl HostList {
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
+        #[cfg(feature = "resource-detail")]
+        let _resource_lock = crate::resource_cost::Scope::new(14);
+
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -8497,12 +8562,48 @@ fn direct_writes() -> bool {
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    write_mapped_counted(dst, src, len);
+}
+
+/// As `write_mapped`, returning kernel write attempts including fallbacks.
+pub(crate) fn write_mapped_counted(dst: *mut u8, src: *const u8, len: usize) -> usize {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let report = |calls: usize| {
+        #[cfg(feature = "diagnostics")]
+        if crate::framelog::on() && len != 0 {
+            let ns = started.elapsed().as_nanos() as u64;
+            thread_local! { static COUNTS: std::cell::RefCell<(u64, [u64; 6], usize)> = const { std::cell::RefCell::new((0, [0; 6], 0)) }; }
+            COUNTS.with(|counts| {
+                let mut c = counts.borrow_mut();
+                let frame = crate::frame::current();
+                if frame != c.0 {
+                    if c.1[0] != 0 {
+                        tracing::info!(target: "victory_gpu::framelog", frame = c.0,
+                            runs = c.1[0], writes = c.1[1], adjacent = c.1[2], bytes = c.1[3],
+                            small = c.1[4], write_ns = c.1[5], "copy-back writes");
+                    }
+                    *c = (frame, [0; 6], 0);
+                }
+                c.1[0] += 1;
+                c.1[1] += calls as u64;
+                c.1[2] += u64::from(c.2 == dst as usize);
+                c.1[3] += len as u64;
+                c.1[4] += u64::from(len < 1024);
+                c.1[5] += ns;
+                c.2 = dst as usize + len;
+            });
+        }
+        calls
+    };
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     #[cfg(feature = "diagnostics")]
     crate::backreads::touched(dst as usize, len, true);
     let direct = direct_writes();
-    let write = |at: usize, n: usize| {
+    let mut calls = 0;
+    let mut write = |at: usize, n: usize| {
+        calls += 1;
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
         if direct {
@@ -8518,15 +8619,35 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
     if len == 0 || write(dst as usize, len) {
-        return;
+        return report(calls);
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+    let ranges = if crate::watch::batch_guards() {
+        crate::watch::guard_runs(vec![(dst as usize, len)], 16 << 20)
+    } else { vec![(dst as usize, len)] };
+    for (mut start, n) in ranges {
+        let end = start + n;
+        while start < end {
+            let (n, protection) = if crate::watch::batch_guards() {
+                crate::watch::guard_region(start, end - start)
+            } else { (end - start, 0) };
+            use windows_sys::Win32::System::Memory::{PAGE_READWRITE, PAGE_EXECUTE_READWRITE};
+            if matches!(protection, PAGE_READWRITE | PAGE_EXECUTE_READWRITE) {
+                if write(start, n) {
+                    crate::framelog::add(crate::framelog::T::BatchedRuns, 1);
+                    start += n;
+                    continue;
+                }
+                crate::watch::batch_guard_failed();
+            }
+            for_pieces(start, n, 64 << 10, |at, n| {
+                if !write(at, n) {
+                    for_pieces(at, n, 4 << 10, |at, n| { write(at, n); });
+                }
             });
+            start += n;
         }
-    });
+    }
+    report(calls)
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -8671,6 +8792,29 @@ fn present_sync_interval() -> u32 {
     })
 }
 
+/// The counters a stall line reports, in the order it reports them. The
+/// first three are counts; the rest are microseconds, so a stall says what
+/// took the time rather than only what happened during it.
+const STALL_COUNTERS: usize = 14;
+fn stall_counts() -> [u64; STALL_COUNTERS] {
+    use crate::framelog::T;
+    [
+        crate::pipeline::frame_log_counts().0,
+        crate::pipeline::kept()[2], // Successful translations; never reset.
+        crate::framelog::total(T::Uploads),
+        crate::framelog::total(T::RefreshUs),
+        crate::framelog::total(T::RefreshStillUs),
+        crate::framelog::total(T::CopyUs),
+        crate::framelog::total(T::PrepareUs),
+        crate::framelog::total(T::CardWaitUs),
+        crate::framelog::total(T::RemapUs),
+        crate::framelog::total(T::RemapWaitUs),
+        crate::framelog::total(T::PipelineWaitUs),
+        crate::framelog::total(T::PresentUs),
+        crate::framelog::total(T::PaceUs),
+        crate::framelog::total(T::ExecuteUs),
+    ]
+}
 #[derive(Default)]
 struct PresentTimes {
     path: Option<std::ffi::OsString>,
@@ -8679,7 +8823,7 @@ struct PresentTimes {
     window_frames: usize,
     window_us: u64,
     stall: Option<f64>,
-    counts: [u64; 3],
+    counts: [u64; STALL_COUNTERS],
 }
 
 impl PresentTimes {
@@ -8701,21 +8845,24 @@ impl PresentTimes {
     fn frame(&mut self) -> std::io::Result<()> {
         let now = std::time::Instant::now();
         // Sample every enabled Present, even short ones: deltas belong to this interval.
-        let counts = self.stall.map(|_| [
-            crate::pipeline::frame_log_counts().0,
-            crate::pipeline::kept()[2], // Successful translations; never reset.
-            crate::framelog::total(crate::framelog::T::Uploads),
-        ]);
+        let counts = self.stall.map(|_| stall_counts());
         if let Some(last) = self.last.replace(now) {
             let interval_ms = now.duration_since(last).as_secs_f64() * 1000.0;
             if let (Some(threshold), Some(counts)) = (self.stall, counts) {
                 if interval_ms > threshold {
-                    let [pipelines_created, shaders_translated, texture_uploads] =
-                        std::array::from_fn(|i| counts[i].wrapping_sub(self.counts[i]));
-                    // Last-save size is not cumulative; descriptor counters reset elsewhere.
-                    tracing::warn!(interval_ms, pipelines_created, shaders_translated,
-                        library_saves = "na", library_bytes = "na", texture_uploads,
-                        descriptor_copies = "na", "Present stall");
+                    let d: [u64; STALL_COUNTERS] = std::array::from_fn(|i| counts[i].wrapping_sub(self.counts[i]));
+                    let ms = |us: u64| (us as f64) / 1000.0;
+                    // Times as well as counts: a stall line that only says
+                    // "three uploads happened" cannot tell whether the time
+                    // went into a refresh, a copy or the card.
+                    tracing::warn!(interval_ms,
+                        pipelines_created = d[0], shaders_translated = d[1], texture_uploads = d[2],
+                        refresh_ms = ms(d[3]), refresh_wait_ms = ms(d[4]), copy_ms = ms(d[5]),
+                        prepare_ms = ms(d[6]), card_wait_ms = ms(d[7]), remap_ms = ms(d[8]),
+                        remap_wait_ms = ms(d[9]), pipeline_wait_ms = ms(d[10]), present_ms = ms(d[11]),
+                        pace_ms = ms(d[12]), execute_ms = ms(d[13]),
+                        library_saves = "na", library_bytes = "na", descriptor_copies = "na",
+                        "Present stall");
                 }
             }
             if self.path.is_some() {
@@ -8797,7 +8944,9 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     times: Option<PresentTimes>,
-    sync_interval: u32,
+    /// The buffer count the chain was made with: a resize has to ask for the
+    /// same number, or the setting is silently undone by the first resize.
+    buffers: u32,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -9146,7 +9295,7 @@ impl Host {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(p.buffers, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
                 Ok(()) => {
@@ -9377,8 +9526,7 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 times: PresentTimes::new(),
-                sync_interval: std::env::var("VICTORY_PRESENT_SYNC").ok()
-                    .and_then(|v| v.parse::<u32>().ok()).filter(|v| *v <= 4).unwrap_or(0),
+                buffers,
             })
         }
     }

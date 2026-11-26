@@ -38,6 +38,8 @@ mod fpsbox;
 mod spread;
 #[cfg(windows)]
 mod draw;
+#[cfg(all(windows, feature = "resource-detail"))]
+mod resource_cost;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;

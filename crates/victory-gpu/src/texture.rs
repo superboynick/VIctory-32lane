@@ -553,6 +553,76 @@ fn through_copy() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_COPY").is_some_and(|v| v == "1"))
 }
 
+/// Merge overlapping/adjacent (address, byte count) ranges, then bound each entry.
+fn prefetch_ranges(ranges: Vec<(usize, usize)>, limit: usize) -> Vec<(usize, usize)> {
+    assert!(limit > 0);
+    let mut spans: Vec<_> = ranges.into_iter().filter_map(|(at, len)| {
+        at.checked_add(len).filter(|&end| end > at).map(|end| (at, end))
+    }).collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (at, end) in spans {
+        if let Some(last) = merged.last_mut().filter(|last| at <= last.1) {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((at, end));
+        }
+    }
+    let mut out = Vec::new();
+    for (mut at, end) in merged {
+        while at < end {
+            let len = (end - at).min(limit);
+            out.push((at, len));
+            at += len;
+        }
+    }
+    out
+}
+
+/// Called with title_memory_reading held, before committed() probes individual pages.
+/// This is a physical-cache hint, not a guarantee of working-set residency.
+fn prefetch_texture(start: usize, len: usize) {
+    use windows_sys::Win32::System::{Memory::*, Threading::GetCurrentProcess};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PREFETCH_TEXTURE").is_some_and(|v| v == "1")) {
+        return;
+    }
+    let Some(end) = start.checked_add(len) else { return; };
+    let mut at = start;
+    let mut ranges = Vec::new();
+    while at < end {
+        // SAFETY: plain output data; the mapping read guard keeps title views stable.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+            break;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+        if next <= at { break; }
+        let readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY
+            | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if info.State == MEM_COMMIT && info.Type == MEM_MAPPED
+            && info.Protect & readable != 0 && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
+            ranges.push((at, next - at));
+        }
+        at = next;
+    }
+    // At most 64 MiB per entry, 1 GiB per syscall; ordinary textures use one call.
+    let entries: Vec<_> = prefetch_ranges(ranges, 64 * 1024 * 1024).into_iter()
+        .map(|(at, len)| WIN32_MEMORY_RANGE_ENTRY { VirtualAddress: at as *mut _, NumberOfBytes: len }).collect();
+    for batch in entries.chunks(16) {
+        // SAFETY: committed readable mapped ranges in this process, with valid entries.
+        let ok = unsafe { PrefetchVirtualMemory(GetCurrentProcess(), batch.len(), batch.as_ptr(), 0) };
+        if ok == 0 {
+            // SAFETY: retrieves this thread's last system-call error before other calls.
+            let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            once!(error, "texture prefetch failed; continuing with the ordinary read");
+        }
+        // Requested bytes, including failed hints; not measured residency or saved faults.
+        crate::framelog::add(crate::framelog::T::TexturePrefetchCalls, 1);
+        crate::framelog::add(crate::framelog::T::TexturePrefetchBytes, batch.iter().map(|e| e.NumberOfBytes as u64).sum());
+    }
+}
+
 /// Calls `f` with the `size` bytes of title memory at `memory`, read
 /// through the kernel into this thread's read buffer; pages that are not
 /// there read as zeros. The bytes are those a read in place would see.
@@ -1184,6 +1254,7 @@ impl Staging {
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
+        prefetch_texture(start, size);
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -1654,6 +1725,24 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn prefetch_merges_adjacent_and_overlapping_ranges_without_bridging_holes() {
+        assert_eq!(super::prefetch_ranges(vec![(20, 10), (0, 10), (8, 4), (12, 8), (40, 2)], 64), [(0, 30), (40, 2)]);
+    }
+
+    #[test]
+    fn prefetch_splits_long_ranges_after_merging() {
+        assert_eq!(super::prefetch_ranges(vec![(8, 13), (3, 5)], 8), [(3, 8), (11, 8), (19, 2)]);
+        assert_eq!(super::prefetch_ranges(vec![(3, 16)], 8), [(3, 8), (11, 8)]);
+    }
+
+    #[test]
+    fn prefetch_ignores_empty_and_overflowing_ranges() {
+        assert!(super::prefetch_ranges(vec![], 8).is_empty());
+        assert!(super::prefetch_ranges(vec![(3, 0), (usize::MAX, 1)], 8).is_empty());
+        assert_eq!(super::prefetch_ranges(vec![(usize::MAX - 2, 2)], 8), [(usize::MAX - 2, 2)]);
+    }
 
     #[test]
     fn partial_upload_rows_and_versions() {

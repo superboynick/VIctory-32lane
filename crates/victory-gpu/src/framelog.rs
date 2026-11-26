@@ -74,10 +74,17 @@ pub enum T {
     TextureFull,
     TexturePartial,
     TextureSkippedBytes,
+    /// Texture prefetch syscall attempts and requested bytes (not resident bytes).
+    TexturePrefetchCalls,
+    TexturePrefetchBytes,
     /// Waiting for host pipelines being made.
     PipelineWaitUs,
     /// Writes taken by the guards on view memory.
     GuardFaults,
+    /// Guard-region queries, bytes covered by batch queries, successful batch operations.
+    GuardQueries,
+    GuardBytes,
+    BatchedRuns,
     /// The title's frame waits: time slept, on every thread.
     PaceUs,
     /// DirectStorage requests finished, their destination bytes, and the
@@ -422,9 +429,9 @@ fn text(f: &Frame) -> String {
          ms {:.1} MB; copy-back {:.1} ms {:.2} MB | card: idle {:.1} ms ({:.1} behind us); by its own clock, of the lists of a moment ago: our \
          send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
          recording, all threads: {:.1} ms in {:.0} calls; tables hit {tables_hit:.0} miss {tables_miss:.0}; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
-         still), {:.0} uploads (subresources full {texture_full:.0} partial {texture_partial:.0}, skipped {texture_skipped:.0} bytes), staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
+         still), {:.0} uploads (subresources full {texture_full:.0} partial {texture_partial:.0}, skipped {texture_skipped:.0} bytes), prefetch {texture_prefetch_calls:.0} calls {texture_prefetch_bytes:.0} requested bytes, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
          readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
-         faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
+         faults: {:.0} page, {:.0} guard; guard_queries {guard_queries:.0} guard_bytes {guard_bytes:.0} batched_runs {batched_runs:.0} | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
          draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
         f.us / 1e3,
         (s(S_THREAD_USER) + s(S_THREAD_KERNEL)) / 1e3,
@@ -486,6 +493,8 @@ fn text(f: &Frame) -> String {
         t(T::RecordLooks),
         tables_hit = t(T::TablesHit), tables_miss = t(T::TablesMiss),
         texture_full = t(T::TextureFull), texture_partial = t(T::TexturePartial), texture_skipped = t(T::TextureSkippedBytes),
+        texture_prefetch_calls = t(T::TexturePrefetchCalls), texture_prefetch_bytes = t(T::TexturePrefetchBytes),
+        guard_queries = t(T::GuardQueries), guard_bytes = t(T::GuardBytes), batched_runs = t(T::BatchedRuns),
     )
 }
 
@@ -630,6 +639,11 @@ mod tests {
         f.t[T::TextureFull as usize] = 3.0;
         f.t[T::TexturePartial as usize] = 2.0;
         f.t[T::TextureSkippedBytes as usize] = 65536.0;
+        f.t[T::TexturePrefetchCalls as usize] = 2.0;
+        f.t[T::TexturePrefetchBytes as usize] = 8192.0;
+        f.t[T::GuardQueries as usize] = 4.0;
+        f.t[T::GuardBytes as usize] = 65536.0;
+        f.t[T::BatchedRuns as usize] = 2.0;
         f
     }
 
@@ -648,6 +662,8 @@ mod tests {
         assert!(out[2].contains("in the present call 40.0 "), "{}", out[2]);
         assert!(out[2].contains(" 400 uploads"), "{}", out[2]);
         assert!(out[2].contains("subresources full 3 partial 2, skipped 65536 bytes"), "{}", out[2]);
+        assert!(out[2].contains("prefetch 2 calls 8192 requested bytes"), "{}", out[2]);
+        assert!(out[2].contains("guard_queries 4 guard_bytes 65536 batched_runs 2"), "{}", out[2]);
     }
 
     #[test]
