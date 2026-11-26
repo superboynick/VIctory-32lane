@@ -739,6 +739,9 @@ impl HostPipeline {
                 Ok(pso) => pso,
                 Err(e) => {
                     trace_failure(&e, desc.NodeMask, desc.Flags.0, desc.CS.BytecodeLength);
+                    if e.code().0 as u32 == 0x80070057 {
+                        pso_ladder(&host.device, &stages[0].0.hash, &params, &samplers, &desc);
+                    }
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
                     return None;
@@ -1133,6 +1136,73 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
+/// PSV resource records: type, register lower/upper bound (inclusive), space.
+fn psv_bindings(data: &[u8]) -> Option<Vec<String>> {
+    let word = |at: usize| Some(u32::from_le_bytes(data.get(at..at.checked_add(4)?)?.try_into().ok()?));
+    let at = 4usize.checked_add(word(0)? as usize)?;
+    let count = word(at)? as usize;
+    if count == 0 { return Some(Vec::new()); }
+    let stride = word(at.checked_add(4)?)? as usize;
+    let start = at.checked_add(8)?;
+    if stride < 16 || start.checked_add(count.checked_mul(stride)?)? > data.len() { return None; }
+    (0..count).map(|i| {
+        let p = start + i * stride;
+        let (kind, space, lo, hi) = (word(p)?, word(p + 4)?, word(p + 8)?, word(p + 12)?);
+        let count = u64::from(hi).checked_sub(u64::from(lo))? + 1;
+        Some(format!("type={kind} register={lo} space={space} count={count}"))
+    }).collect()
+}
+
+fn pso_ladder(device: &ID3D12Device, shader: &str, params: &[D3D12_ROOT_PARAMETER1],
+    samplers: &[D3D12_STATIC_SAMPLER_DESC], original: &D3D12_COMPUTE_PIPELINE_STATE_DESC) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PSO_LADDER").is_some_and(|v| v == "1")) { return; }
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    if !SEEN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()).insert(shader.to_owned()) { return; }
+    // SAFETY: the original creation's bytecode is alive throughout this retry.
+    let bytes = unsafe { std::slice::from_raw_parts(original.CS.pShaderBytecode.cast::<u8>(), original.CS.BytecodeLength) };
+    let bindings = victory_shader::dxbc::Container::parse(bytes).ok()
+        .and_then(|c| c.part(victory_shader::dxbc::FourCC::PSV0).and_then(|p| psv_bindings(p.data)));
+    tracing::info!(shader, psv_bindings = ?bindings, "pso ladder bindings");
+    let direct = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+        | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+    let root = |kind| D3D12_ROOT_PARAMETER1 {
+        ParameterType: kind, ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 { Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+            ShaderRegister: 0, RegisterSpace: 0, Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE } },
+    };
+    let (cbv, uav) = ([root(D3D12_ROOT_PARAMETER_TYPE_CBV)], [root(D3D12_ROOT_PARAMETER_TYPE_UAV)]);
+    let ranges = [D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV].map(|kind| D3D12_DESCRIPTOR_RANGE1 {
+        RangeType: kind, NumDescriptors: 16, BaseShaderRegister: 0, RegisterSpace: 0,
+        Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+        OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+    });
+    let tables = [0, 1].map(|i| D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 { DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+            NumDescriptorRanges: 1, pDescriptorRanges: &ranges[i] } },
+    });
+    for (variant, params, flags) in [
+        ("v1", params, D3D12_ROOT_SIGNATURE_FLAG_NONE), ("v2", &[][..], direct),
+        ("v3", &[][..], D3D12_ROOT_SIGNATURE_FLAG_NONE), ("v4", &cbv[..], direct),
+        ("v5", &uav[..], direct), ("v6", &tables[..], direct),
+    ] {
+        let mut phase = "root_signature";
+        let result = root_signature_flags(device, params, samplers, flags).and_then(|(root, _)| {
+            phase = "pso";
+            let probe = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                // SAFETY: borrowed root; its owning COM reference outlives creation.
+                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                CS: original.CS, NodeMask: original.NodeMask, Flags: original.Flags, ..Default::default()
+            };
+            // SAFETY: root and the original shader bytes are live. Drop every probe PSO.
+            unsafe { device.CreateComputePipelineState::<ID3D12PipelineState>(&probe) }.map(|_| ())
+        });
+        let hr = result.as_ref().err().map_or(0, |e| e.code().0 as u32);
+        tracing::info!(shader, variant, phase, ok = result.is_ok(), hresult = format_args!("0x{hr:08x}"), "pso ladder");
+    }
+}
+
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
@@ -1144,6 +1214,14 @@ fn root_signature(
     } else {
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
     };
+    root_signature_flags(device, params, samplers, input
+        | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+        | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED)
+}
+
+fn root_signature_flags(device: &ID3D12Device, params: &[D3D12_ROOT_PARAMETER1],
+    samplers: &[D3D12_STATIC_SAMPLER_DESC], flags: D3D12_ROOT_SIGNATURE_FLAGS,
+) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
     let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
         Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
@@ -1152,9 +1230,7 @@ fn root_signature(
                 pParameters: params.as_ptr(),
                 NumStaticSamplers: samplers.len() as u32,
                 pStaticSamplers: samplers.as_ptr(),
-                Flags: input
-                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                Flags: flags,
             },
         },
     };
@@ -1186,6 +1262,23 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    fn ladder_psv_bindings_decode_ranges_and_reject_truncation() {
+        let mut data = 48u32.to_le_bytes().to_vec();
+        data.resize(52, 0);
+        for word in [2u32, 24, 2, 7, 3, 5, 13, 0, 7, 0, 0, u32::MAX, 11, 0] {
+            data.extend(word.to_le_bytes());
+        }
+        assert_eq!(psv_bindings(&data).unwrap(), [
+            "type=2 register=3 space=7 count=3", "type=7 register=0 space=0 count=4294967296"]);
+        for len in 0..data.len() { assert!(psv_bindings(&data[..len]).is_none()); }
+        data[72..76].copy_from_slice(&2u32.to_le_bytes()); // upper < lower
+        assert!(psv_bindings(&data).is_none());
+        data.truncate(56);
+        data[52..56].fill(0);
+        assert_eq!(psv_bindings(&data), Some(vec![]));
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };

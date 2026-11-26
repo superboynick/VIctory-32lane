@@ -1090,7 +1090,11 @@ impl Shader {
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
         });
-        let hash = [0u8; 20];
+        // HASH part: the digest of the code, then four flag bytes. Zeros were
+        // left here before; a driver may check the digest when the pipeline is
+        // created, and answer E_INVALIDARG when it does not match.
+        let mut hash = [0u8; 20];
+        hash[..16].copy_from_slice(&container::hash(&dxil));
         let psg1 = container::signature(&self.prims, false);
         let mut parts: Vec<(&[u8; 4], &[u8])> =
             vec![(b"SFI0", &sfi0), (b"ISG1", &isg1), (b"OSG1", &osg1)];
