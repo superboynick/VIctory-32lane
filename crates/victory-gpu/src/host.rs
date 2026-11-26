@@ -9248,6 +9248,9 @@ impl Host {
             // What Present answers was thrown away: a removal it is the
             // first to report then looked as if the next call found it.
             // Said once (a status that is no error, as "occluded", is not).
+            // One call per frame: a second Present here would flip to the
+            // buffer that was never drawn into, which shows as a black frame
+            // between every frame.
             let shown = p.swap_chain.Present(sync_interval, flags);
             if shown.is_err() {
                 static ONCE: std::sync::Once = std::sync::Once::new();
@@ -9255,8 +9258,7 @@ impl Host {
                     tracing::error!("Present answered {:#010x} (said once): the first call to report it, frame {frame}", shown.0 as u32);
                 });
             }
-            let presented = p.swap_chain.Present(p.sync_interval, DXGI_PRESENT(0));
-            if presented.is_ok() {
+            if shown.is_ok() {
                 if let Some(times) = &mut p.times {
                     if let Err(error) = times.frame() {
                         tracing::warn!(%error, "VICTORY_PRESENT_TIMES disabled after write failure");
@@ -9290,6 +9292,21 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            // `VICTORY_SWAP_BUFFERS` and `VICTORY_SWAP_EFFECT` let a machine
+            // that flickers be tried the other way without a rebuild: the
+            // flip model with two buffers alternates between two surfaces,
+            // and on a host whose composition goes through a virtual display
+            // that can show as a black frame between frames.
+            let buffers = std::env::var("VICTORY_SWAP_BUFFERS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|n| (2..=16).contains(n))
+                .unwrap_or(BUFFERS);
+            let effect = match std::env::var("VICTORY_SWAP_EFFECT").ok().as_deref() {
+                Some("discard") => DXGI_SWAP_EFFECT_DISCARD,
+                Some("sequential") => DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                _ => DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            };
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -9299,8 +9316,8 @@ impl Host {
                     Quality: 0,
                 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: BUFFERS,
-                SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                BufferCount: buffers,
+                SwapEffect: effect,
                 ..Default::default()
             };
             let swap_chain = factory
