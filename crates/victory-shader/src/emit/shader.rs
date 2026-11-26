@@ -1088,7 +1088,18 @@ impl Shader {
             geometry: self.geometry.map(|g| g.max_vertices),
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
-            wave_size: self.wave_size,
+            // VICTORY_PSV_WAVE32=1: declare no wave size at all. A shader that
+            // keeps WaveSize=64 is refused outright by a 32-lane device, and
+            // the declaration is what the driver reads; leaving it out lets the
+            // driver use its own waves, which is approximate only for wide wave
+            // intrinsics and exact for everything else.
+            wave_size: if self.wave_size == Some(64)
+                && std::env::var_os("VICTORY_PSV_WAVE32").is_some_and(|v| v == "1")
+            {
+                None
+            } else {
+                self.wave_size
+            },
         });
         // HASH part: the digest of the code, then four flag bytes. Zeros were
         // left here before; a driver may check the digest when the pipeline is
